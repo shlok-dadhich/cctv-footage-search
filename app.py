@@ -68,8 +68,9 @@ VISIBLE_RESULTS_STEP = 10
 
 UPLOAD_VIDEO_TYPES = ["mp4", "mov", "avi", "mkv", "webm", "m4v"]
 MAX_UPLOAD_MB = 500
-MAX_UPLOAD_SECONDS_CPU = 300
+MAX_UPLOAD_SECONDS_CPU = 600
 MAX_UPLOAD_SECONDS_GPU = 1800
+MAX_UPLOAD_TOLERANCE_S = 2
 _INGEST_LOCK = threading.Lock()
 
 
@@ -196,10 +197,10 @@ def _index_uploaded_video(
 
             device = resolve_device("auto")
             max_seconds = MAX_UPLOAD_SECONDS_GPU if device.startswith("cuda") else MAX_UPLOAD_SECONDS_CPU
-            if duration > max_seconds:
+            if duration > max_seconds + MAX_UPLOAD_TOLERANCE_S:
                 raise ValueError(
-                    f"Video is {duration:.0f}s long. The hosted app supports up to "
-                    f"{max_seconds}s per clip; trim it or run the local GPU app."
+                    f"Video is {duration / 60:.1f} min long. The hosted app supports up to "
+                    f"{max_seconds / 60:.0f} min per clip; trim it or run the local GPU app."
                 )
 
             fast_cpu = not device.startswith("cuda")
@@ -1059,8 +1060,8 @@ def main():
                 type=UPLOAD_VIDEO_TYPES,
                 accept_multiple_files=False,
                 help=(
-                    f"Up to {MAX_UPLOAD_MB} MB. Hosted CPU indexing works best with "
-                    "short clips (under 2-3 minutes)."
+                    f"Up to {MAX_UPLOAD_MB} MB and 10 minutes per clip. "
+                    "Longer clips take a few minutes to index on CPU."
                 ),
             )
             upload_camera = st.text_input("Camera ID", value="upload", key="upload_camera")
