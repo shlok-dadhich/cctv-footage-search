@@ -1,0 +1,15 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+streamlit==1.66.1
+numpy==2.5.4
+opencv-python-headless==5.0.0.93
+pillow==13.0.0
+torch==2.11.0+cpu
+torchvision==0.26.0+cpu
+transformers==5.22.1
+safetensors==0.8.0
+huggingface_hub==2.4.0
+tokenizers==0.23.3
+rfdetr==1.11.2
+supervision==0.31.3
+ultralytics==8.4.197
+tzdata==2026.6
