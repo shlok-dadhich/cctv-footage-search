@@ -781,9 +781,9 @@ def _fetch_entity_detail(
 def main():
     db_path = get_db_path().resolve()
     database_exists = db_path.is_file()
-    # Open read-write so the absolute-time schema migration can run on first use;
-    # WAL mode makes concurrent access during ingestion safe.
-    db = get_database(str(db_path))
+    # The deployment bundle is already migrated. Open read-only so the app never
+    # mutates the demo index and works without SQLite sidecar files.
+    db = get_database(str(db_path), read_only=database_exists)
 
     # ── Sidebar ──────────────────────────────────────────────────────
     with st.sidebar:
