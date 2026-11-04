@@ -3,6 +3,8 @@ streamlit==1.66.1
 numpy==2.5.4
 opencv-python-headless==5.0.0.93
 pillow==13.0.0
+av==19.0.2
+tqdm==4.70.1
 torch==2.11.0+cpu
 torchvision==0.26.0+cpu
 transformers==5.22.1

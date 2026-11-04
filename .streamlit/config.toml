@@ -1,5 +1,8 @@
 # Neutral dual light/dark theme for the CCTV search app.
 
+[server]
+maxUploadSize = 1024
+
 [theme]
 showWidgetBorder = true
 showSidebarBorder = true

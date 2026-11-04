@@ -1,0 +1,4 @@
+{
+  "cam_default": {"tz": "Asia/Kolkata"},
+  "_comment": "Map camera_id -> IANA timezone used to parse and display local times. Default: Asia/Kolkata."
+}

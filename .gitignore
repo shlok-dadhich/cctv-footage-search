@@ -6,4 +6,6 @@ data/
 torchinductor_*/
 *.db-wal
 *.db-shm
+cctv_web_sessions/
+outputs/sessions/
 

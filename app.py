@@ -16,8 +16,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import shutil
 import sqlite3
 import sys
+import tempfile
+import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -61,11 +66,231 @@ CROPS_DIR = ROOT_DIR / "outputs" / "crops"
 DEFAULT_VISIBLE_RESULTS = 7
 VISIBLE_RESULTS_STEP = 10
 
+UPLOAD_VIDEO_TYPES = ["mp4", "mov", "avi", "mkv", "webm", "m4v"]
+MAX_UPLOAD_MB = 500
+MAX_UPLOAD_SECONDS_CPU = 300
+MAX_UPLOAD_SECONDS_GPU = 1800
+_INGEST_LOCK = threading.Lock()
+
+
+# ── Session Upload Helpers ───────────────────────────────────────────
+
+def _upload_state() -> dict[str, Any]:
+    return dict(st.session_state.get("upload_state") or {})
+
+
+def _active_upload_state() -> dict[str, Any]:
+    if st.session_state.get("source_mode") == "upload":
+        return _upload_state()
+    return {}
+
+
+def _writable_session_root() -> Path:
+    """Find a writable directory for per-browser-session uploads."""
+    cached = st.session_state.get("session_root")
+    if cached and Path(cached).is_dir():
+        return Path(cached)
+
+    candidates: list[Path] = []
+    try:
+        candidates.append(Path(tempfile.gettempdir()) / "cctv_web_sessions")
+    except Exception:
+        pass
+    candidates.append(ROOT_DIR / "outputs" / "sessions")
+
+    for base in candidates:
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            probe = base / f".write_{uuid.uuid4().hex}"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            st.session_state["session_root"] = str(base)
+            return base
+        except Exception:
+            continue
+    raise RuntimeError("No writable directory is available for uploaded videos.")
+
+
+def _session_upload_root() -> Path:
+    session_id = st.session_state.get("session_id")
+    if not session_id:
+        session_id = uuid.uuid4().hex[:12]
+        st.session_state["session_id"] = session_id
+    return _writable_session_root() / session_id
+
+
+def _sanitize_name(value: str, max_len: int = 40) -> str:
+    clean = "".join(c if c.isalnum() or c in "-_" else "_" for c in value).strip("_")
+    return (clean or "video")[:max_len]
+
+
+def _crop_search_dirs() -> list[Path]:
+    state = _active_upload_state()
+    dirs: list[Path] = []
+    if state.get("crops_dir"):
+        dirs.append(Path(state["crops_dir"]))
+    dirs.append(CROPS_DIR)
+    return dirs
+
+
+def _clip_search_dirs() -> list[Path]:
+    state = _active_upload_state()
+    dirs: list[Path] = []
+    if state.get("clips_dir"):
+        dirs.append(Path(state["clips_dir"]))
+    dirs.append(CLIP_DIR)
+    return dirs
+
+
+def _active_clips_dir() -> Path:
+    state = _active_upload_state()
+    if state.get("clips_dir"):
+        return Path(state["clips_dir"])
+    return CLIP_DIR
+
+
+def _index_uploaded_video(
+    uploaded: Any,
+    camera_id: str,
+    vid_stride: int,
+    detect_objects: bool,
+    start_time: str,
+) -> None:
+    """Save and index one uploaded video into this browser session only."""
+    if not _INGEST_LOCK.acquire(blocking=False):
+        st.warning("Another video is being indexed right now. Please wait and try again.")
+        return
+
+    upload_root = _session_upload_root() / uuid.uuid4().hex[:8]
+    uploads_dir = upload_root / "uploads"
+    crops_dir = upload_root / "crops"
+    clips_dir = upload_root / "clips"
+    db_path = upload_root / "cctv.db"
+    db = None
+    try:
+        for directory in (uploads_dir, crops_dir, clips_dir):
+            directory.mkdir(parents=True, exist_ok=True)
+
+        suffix = Path(uploaded.name).suffix.lower()
+        if suffix not in {f".{ext}" for ext in UPLOAD_VIDEO_TYPES}:
+            raise ValueError("Unsupported video format. Use MP4, MOV, AVI, MKV, WEBM, or M4V.")
+        if getattr(uploaded, "size", 0) and uploaded.size > MAX_UPLOAD_MB * 1024 * 1024:
+            raise ValueError(f"Video is larger than {MAX_UPLOAD_MB} MB. Please upload a shorter clip.")
+
+        video_id = f"upload_{_sanitize_name(Path(uploaded.name).stem, 32)}_{uuid.uuid4().hex[:6]}"
+        source_path = uploads_dir / f"{video_id}{suffix}"
+
+        with st.status("Indexing uploaded video", expanded=True) as status:
+            status.write("Saving video...")
+            uploaded.seek(0)
+            with open(source_path, "wb") as handle:
+                while True:
+                    chunk = uploaded.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+
+            duration = get_video_duration(str(source_path))
+            from common.device import resolve_device
+
+            device = resolve_device("auto")
+            max_seconds = MAX_UPLOAD_SECONDS_GPU if device.startswith("cuda") else MAX_UPLOAD_SECONDS_CPU
+            if duration > max_seconds:
+                raise ValueError(
+                    f"Video is {duration:.0f}s long. The hosted app supports up to "
+                    f"{max_seconds}s per clip; trim it or run the local GPU app."
+                )
+
+            fast_cpu = not device.startswith("cuda")
+            if fast_cpu and detect_objects:
+                status.write("CPU mode: clothing/object detection is skipped for speed.")
+                detect_objects = False
+
+            status.write(f"Video: {duration:.0f}s | device: {device.upper()}")
+
+            yolo_root = _writable_session_root() / ".ultralytics"
+            yolo_root.mkdir(parents=True, exist_ok=True)
+            os.environ["YOLO_CONFIG_DIR"] = str(yolo_root)
+            yolo_weight = yolo_root / "yolo26n.pt"
+
+            db = CCTVDatabase(db_path)
+
+            progress = st.progress(0.0)
+
+            def on_progress(done: int, total: int) -> None:
+                progress.progress(min(1.0, max(0.0, done / max(1, total))))
+
+            from ingest import run_phase_a_ingest, run_phase_b_embed
+
+            status.write("Detecting, tracking, and saving snapshots...")
+            result = run_phase_a_ingest(
+                source_path=str(source_path),
+                db=db,
+                video_id=video_id,
+                camera_id=_sanitize_name(camera_id or "upload", 40),
+                device=device,
+                vid_stride=max(1, int(vid_stride)),
+                person_model=str(yolo_weight) if fast_cpu else "rfdetr-small",
+                vehicle_model=str(yolo_weight) if fast_cpu else "rfdetr-medium",
+                skip_objects=not detect_objects,
+                save_crops=True,
+                crops_dir=crops_dir,
+                start_time_arg=start_time.strip() or None,
+                progress_cb=on_progress,
+            )
+
+            status.write("Building SigLIP embeddings...")
+            embedded = 0
+            if result["saved_crops"]:
+                embedded = run_phase_b_embed(
+                    db=db,
+                    video_id=video_id,
+                    saved_crops=result["saved_crops"],
+                    device=device,
+                    batch_size=8 if fast_cpu else 16,
+                )
+
+            summary = db.get_video_summary(video_id)
+            try:
+                db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                db.conn.execute("PRAGMA journal_mode=DELETE")
+            except sqlite3.OperationalError:
+                pass
+            progress.empty()
+            status.update(label="Video indexed", state="complete", expanded=False)
+
+        st.session_state["upload_state"] = {
+            "video_id": video_id,
+            "name": uploaded.name,
+            "db_path": str(db_path),
+            "source_path": str(source_path),
+            "crops_dir": str(crops_dir),
+            "clips_dir": str(clips_dir),
+            "camera_id": camera_id or "upload",
+            "duration_s": duration,
+            "persons": summary["persons"],
+            "vehicles": summary["vehicles"],
+            "objects": summary["objects"],
+            "embeddings": embedded,
+        }
+        st.session_state["source_mode"] = "upload"
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Indexing failed: {exc}")
+        shutil.rmtree(upload_root, ignore_errors=True)
+    finally:
+        if db is not None:
+            db.close()
+        _INGEST_LOCK.release()
+
 
 # ── Database & Helpers ───────────────────────────────────────────────
 
 def get_db_path() -> Path:
-    """Get the database path from CLI args or default."""
+    """Get the database path from the active source or CLI args/default."""
+    state = _active_upload_state()
+    if state.get("db_path"):
+        return Path(state["db_path"])
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
     try:
@@ -203,10 +428,11 @@ def _load_saved_crop(entity: str, video_id: str, track_id: int | str) -> np.ndar
     """Load the representative crop saved during ingest (matches the stored bbox)."""
     if track_id in (None, "—", ""):
         return None
-    for ext in ("jpg", "png", "jpeg"):
-        path = CROPS_DIR / entity / video_id / f"{entity}_{track_id}.{ext}"
-        if path.is_file():
-            return cv2.imread(str(path))
+    for crops_dir in _crop_search_dirs():
+        for ext in ("jpg", "png", "jpeg"):
+            path = crops_dir / entity / video_id / f"{entity}_{track_id}.{ext}"
+            if path.is_file():
+                return cv2.imread(str(path))
     return None
 
 
@@ -216,11 +442,10 @@ def _find_saved_clip(entity: str, video_id: str, track_id: int | str) -> Path | 
         return None
     safe_video_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in video_id)
     prefix = f"{entity}_{safe_video_id}_trk{track_id}_"
-    candidates = sorted(
-        CLIP_DIR.glob(f"{prefix}*.mp4"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
+    candidates: list[Path] = []
+    for clips_dir in _clip_search_dirs():
+        candidates.extend(clips_dir.glob(f"{prefix}*.mp4"))
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     for path in candidates:
         if path.is_file() and path.stat().st_size > 1024:
             return path
@@ -241,9 +466,10 @@ def extract_event_clip(
     start_s = max(0.0, event_time_s - pad_s)
     end_s = min(duration, event_time_s + pad_s) if duration > 0 else event_time_s + pad_s
 
-    CLIP_DIR.mkdir(parents=True, exist_ok=True)
+    clips_dir = _active_clips_dir()
+    clips_dir.mkdir(parents=True, exist_ok=True)
     clean_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in clip_id)
-    output_path = CLIP_DIR / f"{clean_id}_{int(start_s)}s_to_{int(end_s)}s.mp4"
+    output_path = clips_dir / f"{clean_id}_{int(start_s)}s_to_{int(end_s)}s.mp4"
 
     # Return cached if already extracted and non-empty (and make old clips playable).
     if output_path.is_file():
@@ -779,6 +1005,12 @@ def _fetch_entity_detail(
 # ═══════════════════════════════════════════════════════════════════════
 
 def main():
+    initial_upload = _upload_state()
+    if "source_mode" not in st.session_state:
+        st.session_state["source_mode"] = "upload" if initial_upload.get("db_path") else "demo"
+    if st.session_state.get("source_mode") == "upload" and not initial_upload.get("db_path"):
+        st.session_state["source_mode"] = "demo"
+
     db_path = get_db_path().resolve()
     database_exists = db_path.is_file()
     # The deployment bundle is already migrated. Open read-only so the app never
@@ -790,13 +1022,98 @@ def main():
         st.markdown("### CCTV search")
         st.caption("Search indexed person, vehicle, and object tracks.")
 
+        upload_state = _upload_state()
+        has_upload = bool(upload_state.get("db_path"))
+        source_options = ["Demo footage"]
+        if has_upload:
+            source_options.append("Uploaded video")
+        current_source = (
+            "Uploaded video"
+            if st.session_state.get("source_mode") == "upload" and has_upload
+            else "Demo footage"
+        )
+        choice = st.radio(
+            "Search source",
+            source_options,
+            index=source_options.index(current_source),
+            horizontal=True,
+        )
+        next_mode = "upload" if choice == "Uploaded video" else "demo"
+        if next_mode != st.session_state.get("source_mode"):
+            st.session_state["source_mode"] = next_mode
+            st.rerun()
+
+        if has_upload:
+            st.caption(
+                f"Active upload: `{upload_state.get('name', 'video')}` · "
+                f"{upload_state.get('persons', 0)} persons · "
+                f"{upload_state.get('vehicles', 0)} vehicles"
+            )
+
+        with st.expander("Index your own video", expanded=not has_upload):
+            uploaded_video = st.file_uploader(
+                "Video file",
+                type=UPLOAD_VIDEO_TYPES,
+                accept_multiple_files=False,
+                help=(
+                    f"Up to {MAX_UPLOAD_MB} MB. Hosted CPU indexing works best with "
+                    "short clips (under 2-3 minutes)."
+                ),
+            )
+            upload_camera = st.text_input("Camera ID", value="upload", key="upload_camera")
+            upload_start = st.text_input(
+                "Footage start time (optional)",
+                placeholder="YYYY-MM-DD HH:MM",
+                key="upload_start",
+                help="Used for time-based queries such as 'last night' or '6 pm'.",
+            )
+            upload_stride = st.select_slider(
+                "Frame stride",
+                options=[3, 5, 10, 15, 20],
+                value=10,
+                key="upload_stride",
+                help="Higher values are faster but sample fewer frames.",
+            )
+            upload_objects = st.checkbox(
+                "Detect clothing and objects (slower)",
+                value=False,
+                key="upload_objects",
+                help="Skipped automatically on CPU to keep indexing responsive.",
+            )
+            if st.button(
+                "Index video",
+                type="primary",
+                width="stretch",
+                disabled=uploaded_video is None,
+            ):
+                _index_uploaded_video(
+                    uploaded_video,
+                    upload_camera,
+                    upload_stride,
+                    upload_objects,
+                    upload_start,
+                )
+                if st.session_state.get("upload_state") and st.session_state.get("source_mode") == "upload":
+                    st.rerun()
+
+            if has_upload:
+                st.caption("Uploads are kept for this browser session and cleared on app restart.")
+                if st.button("Remove uploaded video", key="remove_upload"):
+                    try:
+                        get_database(str(Path(upload_state["db_path"]))).close()
+                    except Exception:
+                        pass
+                    get_database.clear()
+                    shutil.rmtree(Path(upload_state["db_path"]).parent, ignore_errors=True)
+                    st.session_state.pop("upload_state", None)
+                    st.session_state["source_mode"] = "demo"
+                    st.rerun()
+
         if not database_exists:
             st.warning(f"No footage has been indexed yet. Database: `{db_path}`")
-            st.caption("Run the detection pipelines to add footage:")
+            st.caption("Upload a video above or run the detection pipelines locally:")
             st.code(
-                "python person/_detect_person.py --source data/raw/cam1.mp4 --db outputs/cctv.db\n"
-                "python vechical/detect_vehicle.py --source data/raw/cam1.mp4 --db outputs/cctv.db\n"
-                "python object_detection/detect_clothes_objects.py --source data/raw/cam1.mp4 --db outputs/cctv.db",
+                "python ingest.py --source data/raw/cam1.mp4 --db outputs/cctv.db --embed",
                 language="bash",
             )
 
