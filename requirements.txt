@@ -14,4 +14,5 @@ tokenizers==0.23.3
 rfdetr==1.11.2
 supervision==0.31.3
 ultralytics==8.4.197
+lap==0.5.14
 tzdata==2026.6
