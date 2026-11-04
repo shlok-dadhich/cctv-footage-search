@@ -167,6 +167,7 @@ def _index_uploaded_video(
     clips_dir = upload_root / "clips"
     db_path = upload_root / "cctv.db"
     db = None
+    failed = False
     try:
         for directory in (uploads_dir, crops_dir, clips_dir):
             directory.mkdir(parents=True, exist_ok=True)
@@ -276,10 +277,12 @@ def _index_uploaded_video(
         st.session_state["source_mode"] = "upload"
     except Exception as exc:  # noqa: BLE001
         st.error(f"Indexing failed: {exc}")
-        shutil.rmtree(upload_root, ignore_errors=True)
+        failed = True
     finally:
         if db is not None:
             db.close()
+        if failed:
+            shutil.rmtree(upload_root, ignore_errors=True)
         _INGEST_LOCK.release()
 
 
